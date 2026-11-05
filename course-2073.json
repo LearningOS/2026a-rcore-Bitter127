@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "courseId": 2073,
+  "repository": "LearningOS/2026a-rcore-Bitter127",
+  "user": "Bitter127",
+  "totalScore": 500,
+  "chapters": {
+    "ch4": {
+      "points": "16/16",
+      "score": 100,
+      "commit": "a280e8c1d2364ca5cc564b9ea663173ee8addaf6"
+    }
+  },
+  "score": 100,
+  "upload": {
+    "status": "pending",
+    "runId": "42021153807",
+    "runAttempt": "1"
+  }
+}
