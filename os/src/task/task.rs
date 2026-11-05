@@ -3,7 +3,7 @@ use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 use crate::config::TRAP_CONTEXT_BASE;
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::{MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
@@ -71,6 +71,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Scheduling priority. Larger values receive more CPU time.
+    pub priority: usize,
+
+    /// Accumulated stride used to order runnable processes.
+    pub stride: u128,
 }
 
 impl TaskControlBlockInner {
@@ -135,6 +141,8 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: 16,
+                    stride: 0,
                 })
             },
         };
@@ -165,6 +173,9 @@ impl TaskControlBlock {
         inner.memory_set = memory_set;
         // update trap_cx ppn
         inner.trap_cx_ppn = trap_cx_ppn;
+        inner.base_size = user_sp;
+        inner.heap_bottom = user_sp;
+        inner.program_brk = user_sp;
         // initialize trap_cx
         let trap_cx = TrapContext::app_init_context(
             entry_point,
@@ -216,6 +227,8 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: parent_inner.priority,
+                    stride: parent_inner.stride,
                 })
             },
         });
@@ -260,6 +273,34 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// Map a range into this process's address space.
+    pub fn map_user_range(
+        &self,
+        start: VirtAddr,
+        end: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        self.inner_exclusive_access()
+            .memory_set
+            .map_user_range(start, end, permission)
+    }
+
+    /// Unmap a range previously created by `map_user_range`.
+    pub fn unmap_user_range(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        self.inner_exclusive_access()
+            .memory_set
+            .unmap_user_range(start, end)
+    }
+
+    /// Set the scheduling priority. Priorities zero and one are invalid.
+    pub fn set_priority(&self, priority: isize) -> isize {
+        if priority < 2 {
+            return -1;
+        }
+        self.inner_exclusive_access().priority = priority as usize;
+        priority
     }
 }
 
