@@ -8,7 +8,7 @@ use crate::config::{
     KERNEL_STACK_SIZE, MEMORY_END, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE,
 };
 use crate::sync::UPSafeCell;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -37,6 +37,7 @@ lazy_static! {
 pub struct MemorySet {
     page_table: PageTable,
     areas: Vec<MapArea>,
+    mmap_pages: BTreeSet<VirtPageNum>,
 }
 
 impl MemorySet {
@@ -45,6 +46,7 @@ impl MemorySet {
         Self {
             page_table: PageTable::new(),
             areas: Vec::new(),
+            mmap_pages: BTreeSet::new(),
         }
     }
     /// Get the page table token
@@ -232,6 +234,54 @@ impl MemorySet {
     /// Translate a virtual page number to a page table entry
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
+    }
+
+    /// Map a previously unused user virtual-address range.
+    pub fn map_user_range(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let pages = VPNRange::new(start.floor(), end.ceil());
+        if pages.into_iter().any(|vpn| {
+            self.page_table
+                .translate(vpn)
+                .is_some_and(|pte| pte.is_valid())
+        }) {
+            return false;
+        }
+        for vpn in pages {
+            let next: VirtAddr = VirtPageNum(vpn.0 + 1).into();
+            self.push(
+                MapArea::new(vpn.into(), next, MapType::Framed, permission),
+                None,
+            );
+            self.mmap_pages.insert(vpn);
+        }
+        true
+    }
+
+    /// Unmap pages that were previously created through `map_user_range`.
+    pub fn unmap_user_range(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        let pages = VPNRange::new(start.floor(), end.ceil());
+        if pages.into_iter().any(|vpn| !self.mmap_pages.contains(&vpn)) {
+            return false;
+        }
+        for vpn in pages {
+            let index = self
+                .areas
+                .iter()
+                .position(|area| {
+                    area.vpn_range.get_start() == vpn
+                        && area.vpn_range.get_end() == VirtPageNum(vpn.0 + 1)
+                })
+                .unwrap();
+            let mut area = self.areas.remove(index);
+            area.unmap(&mut self.page_table);
+            self.mmap_pages.remove(&vpn);
+        }
+        true
     }
     /// shrink the area to new_end
     #[allow(unused)]
