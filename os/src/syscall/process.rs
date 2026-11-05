@@ -1,12 +1,19 @@
 use crate::{
+    config::PAGE_SIZE,
     fs::{open_file, OpenFlags},
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{
+        translated_ref, translated_refmut, translated_str, MapPermission, PageTable, PhysAddr,
+        VirtAddr,
+    },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
         suspend_current_and_run_next, SignalFlags,
     },
+    timer::get_time_us,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
+
+const USER_VA_LIMIT: usize = 1 << 38;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -151,34 +158,78 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    let us = get_time_us();
+    let value = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &value as *const TimeVal as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    if copy_to_user(ts as usize, bytes) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// mmap syscall
 ///
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    let Some(end) = valid_user_range(start, len) else {
+        return -1;
+    };
+    if start % PAGE_SIZE != 0 || prot == 0 || prot & !0x7 != 0 {
+        return -1;
+    }
+    let mut permission = MapPermission::U;
+    if prot & 1 != 0 {
+        permission |= MapPermission::R;
+    }
+    if prot & 2 != 0 {
+        permission |= MapPermission::W;
+    }
+    if prot & 4 != 0 {
+        permission |= MapPermission::X;
+    }
+    let process = current_process();
+    let ok = process.inner_exclusive_access().memory_set.map_user_range(
+        start.into(),
+        end.into(),
+        permission,
     );
-    -1
+    if ok {
+        0
+    } else {
+        -1
+    }
 }
 
 /// munmap syscall
 ///
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    let Some(end) = valid_user_range(start, len) else {
+        return -1;
+    };
+    if start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    let process = current_process();
+    let ok = process
+        .inner_exclusive_access()
+        .memory_set
+        .unmap_user_range(start.into(), end.into());
+    if ok {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -193,21 +244,69 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
 /// spawn syscall
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    let parent = current_process();
+    let path = translated_str(current_user_token(), path);
+    let Some(inode) = open_file(path.as_str(), OpenFlags::RDONLY) else {
+        return -1;
+    };
+    let child = crate::task::ProcessControlBlock::new(inode.read_all().as_slice());
+    let pid = child.getpid();
+    child.inner_exclusive_access().parent = Some(Arc::downgrade(&parent));
+    parent.inner_exclusive_access().children.push(child);
+    pid as isize
 }
 
 /// set priority syscall
 ///
 /// YOUR JOB: Set task priority
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+pub fn sys_set_priority(priority: isize) -> isize {
+    if priority < 2 {
+        return -1;
+    }
+    current_task().unwrap().inner_exclusive_access().priority = priority as usize;
+    priority
+}
+
+fn valid_user_range(start: usize, len: usize) -> Option<usize> {
+    if len == 0 || start >= USER_VA_LIMIT {
+        return None;
+    }
+    start.checked_add(len).filter(|end| *end <= USER_VA_LIMIT)
+}
+
+fn translate_user_address(address: usize, write: bool) -> Option<PhysAddr> {
+    if address >= USER_VA_LIMIT {
+        return None;
+    }
+    let va = VirtAddr::from(address);
+    let entry = PageTable::from_token(current_user_token()).translate(va.floor())?;
+    if !entry.is_valid()
+        || !entry.user_accessible()
+        || if write {
+            !entry.writable()
+        } else {
+            !entry.readable()
+        }
+    {
+        return None;
+    }
+    let page_base: PhysAddr = entry.ppn().into();
+    Some((usize::from(page_base) + va.page_offset()).into())
+}
+
+fn copy_to_user(destination: usize, bytes: &[u8]) -> bool {
+    if valid_user_range(destination, bytes.len()).is_none() {
+        return false;
+    }
+    if !(0..bytes.len()).all(|offset| translate_user_address(destination + offset, true).is_some())
+    {
+        return false;
+    }
+    for (offset, byte) in bytes.iter().enumerate() {
+        *translate_user_address(destination + offset, true)
+            .unwrap()
+            .get_mut::<u8>() = *byte;
+    }
+    true
 }

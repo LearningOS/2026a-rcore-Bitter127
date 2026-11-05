@@ -47,8 +47,18 @@ pub struct ProcessControlBlockInner {
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
     /// semaphore list
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
+    /// Initial capacity of each semaphore (its resources do not change at runtime).
+    pub semaphore_total: Vec<usize>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// Whether resource-allocation checks are enabled for this process.
+    pub deadlock_detect: bool,
+    /// Resources currently held by each thread.
+    pub mutex_allocation: Vec<Vec<usize>>,
+    pub semaphore_allocation: Vec<Vec<usize>>,
+    /// Requests made by threads that would otherwise block.
+    pub mutex_request: Vec<Vec<usize>>,
+    pub semaphore_request: Vec<Vec<usize>>,
 }
 
 impl ProcessControlBlockInner {
@@ -81,6 +91,68 @@ impl ProcessControlBlockInner {
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+    /// Keep the resource matrices in step with dynamically created threads and objects.
+    pub fn prepare_deadlock_check(&mut self) {
+        let task_count = self.tasks.len();
+        let mutex_count = self.mutex_list.len();
+        let semaphore_count = self.semaphore_list.len();
+        self.mutex_allocation.resize_with(task_count, Vec::new);
+        self.mutex_request.resize_with(task_count, Vec::new);
+        self.semaphore_allocation.resize_with(task_count, Vec::new);
+        self.semaphore_request.resize_with(task_count, Vec::new);
+        for row in self.mutex_allocation.iter_mut() {
+            row.resize(mutex_count, 0);
+        }
+        for row in self.mutex_request.iter_mut() {
+            row.resize(mutex_count, 0);
+        }
+        for row in self.semaphore_allocation.iter_mut() {
+            row.resize(semaphore_count, 0);
+        }
+        for row in self.semaphore_request.iter_mut() {
+            row.resize(semaphore_count, 0);
+        }
+    }
+    /// Run the safety reduction used by the deadlock-detection syscalls.
+    pub fn has_deadlock(&self) -> bool {
+        let mutex_count = self.mutex_list.len();
+        let semaphore_count = self.semaphore_list.len();
+        let mut work = vec![0usize; mutex_count + semaphore_count];
+        for id in 0..mutex_count {
+            let held: usize = self.mutex_allocation.iter().map(|row| row[id]).sum();
+            work[id] = 1usize.saturating_sub(held);
+        }
+        for id in 0..semaphore_count {
+            let held: usize = self.semaphore_allocation.iter().map(|row| row[id]).sum();
+            work[mutex_count + id] = self.semaphore_total[id].saturating_sub(held);
+        }
+        let mut finish: Vec<bool> = self.tasks.iter().map(|task| task.is_none()).collect();
+        loop {
+            let mut progressed = false;
+            for tid in 0..finish.len() {
+                if finish[tid] {
+                    continue;
+                }
+                let mutex_ok = (0..mutex_count).all(|id| self.mutex_request[tid][id] <= work[id]);
+                let semaphore_ok = (0..semaphore_count)
+                    .all(|id| self.semaphore_request[tid][id] <= work[mutex_count + id]);
+                if mutex_ok && semaphore_ok {
+                    for id in 0..mutex_count {
+                        work[id] += self.mutex_allocation[tid][id];
+                    }
+                    for id in 0..semaphore_count {
+                        work[mutex_count + id] += self.semaphore_allocation[tid][id];
+                    }
+                    finish[tid] = true;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        finish.iter().any(|done| !done)
     }
 }
 
@@ -118,7 +190,13 @@ impl ProcessControlBlock {
                     task_res_allocator: RecycleAllocator::new(),
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
+                    semaphore_total: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_allocation: Vec::new(),
+                    semaphore_allocation: Vec::new(),
+                    mutex_request: Vec::new(),
+                    semaphore_request: Vec::new(),
                 })
             },
         });
@@ -244,7 +322,13 @@ impl ProcessControlBlock {
                     task_res_allocator: RecycleAllocator::new(),
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
+                    semaphore_total: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_allocation: Vec::new(),
+                    semaphore_allocation: Vec::new(),
+                    mutex_request: Vec::new(),
+                    semaphore_request: Vec::new(),
                 })
             },
         });
@@ -264,6 +348,13 @@ impl ProcessControlBlock {
             // but mention that we allocate a new kstack here
             false,
         ));
+        {
+            let parent_task = parent.get_task(0);
+            let parent_task_inner = parent_task.inner_exclusive_access();
+            let mut task_inner = task.inner_exclusive_access();
+            task_inner.priority = parent_task_inner.priority;
+            task_inner.stride = parent_task_inner.stride;
+        }
         // attach task to child process
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));

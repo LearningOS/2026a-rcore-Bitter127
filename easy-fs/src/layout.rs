@@ -79,6 +79,7 @@ impl SuperBlock {
 
 /// Inode Type of easy-fs
 #[derive(PartialEq)]
+#[repr(u16)]
 pub enum DiskInodeType {
     /// File type
     File,
@@ -100,6 +101,8 @@ pub struct DiskInode {
     pub indirect1: u32,
     /// two-level indirect block id
     pub indirect2: u32,
+    /// number of directory entries referring to this inode
+    nlink: u16,
     /// inode type
     type_: DiskInodeType,
 }
@@ -111,6 +114,7 @@ impl DiskInode {
         self.direct.iter_mut().for_each(|v| *v = 0);
         self.indirect1 = 0;
         self.indirect2 = 0;
+        self.nlink = 1;
         self.type_ = type_;
     }
     /// inode is directory?
@@ -121,6 +125,19 @@ impl DiskInode {
     #[allow(unused)]
     pub fn is_file(&self) -> bool {
         self.type_ == DiskInodeType::File
+    }
+    /// Number of hard links.
+    pub fn nlink(&self) -> u32 {
+        self.nlink as u32
+    }
+    /// Add a hard link.
+    pub fn increase_nlink(&mut self) {
+        self.nlink = self.nlink.checked_add(1).unwrap();
+    }
+    /// Remove a hard link.
+    pub fn decrease_nlink(&mut self) {
+        assert!(self.nlink > 0);
+        self.nlink -= 1;
     }
     /// Return block number correspond to size.
     pub fn data_blocks(&self) -> u32 {
